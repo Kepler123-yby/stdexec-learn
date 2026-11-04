@@ -181,6 +181,14 @@ auto s2 = sndr | stdexec::then(f);
 相互等效，那我们可以推导，左结合是以有到右的方式传参数：
 
 ```cpp
+auto pipeline = stdexec::just(std::string{"hello"})
+              | stdexec::then([](std::string s) { return s + ", world"; })
+              | stdexec::then([](std::string s) { return s.size(); });
+
+auto pipeline = stdexec::then(stdexec::then(std::just(std::string{"hello"}, f2）, f3);
+```
+
+```cpp
 sndr | stdexec::then(f) = stdexec::then(sndr, f)
 // 同样，有
 
