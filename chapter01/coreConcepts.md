@@ -39,7 +39,7 @@
 
 > *A sender is an object that describes an asynchronous computation that may happen later. It can do nothing on its own, but when connected to a receiver, it returns an operation state that can start the work described by the sender.*
 
-简单来说就是描述执行器状态的一个对象，它自己可能不会执行操作，但可以返回于其连接的执行器执行状态的描述
+简单来说，sender 是对“某个将来才会发生的异步计算”的描述。它自己什么都不会做；只有当它与一个 receiver 连接（`connect`）后，才会得到一个操作状态（operation state），再调用 `start` 才真正开始执行。
 
 **发送者特性：**
 
@@ -51,7 +51,7 @@
 **创建sender:**
 
 ```cpp
-auto sender = stdexec::schedule(shced);
+auto sender = stdexec::schedule(sched);
 ```
 
 ## sender algorithm 发送方方法

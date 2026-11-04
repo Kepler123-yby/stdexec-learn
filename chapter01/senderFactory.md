@@ -12,10 +12,10 @@
 
 **使用案例：**
 
-通常搭配`lambda`和`std::exec::then`使用：
+通常搭配`lambda`和`stdexec::then`使用，`just`给出的值会作为参数传给后面的`lambda`（值的个数和类型要对得上）：
 
 ```cpp
-auto sender = stdexec::just() | 
+auto sender = stdexec::just(21) | 
               stdexec::then([](int x) { 
                   return x * 2; 
               });
@@ -29,13 +29,17 @@ auto sender = stdexec::just() |
 
 简单来说就是和`stdexec::just`类似，搭配的另一个工具是`stdexec::upon_error`，只不过它是在错误通道上使用的。
 
-## just_stopped - 执行字面量消除操作
+注意：错误值不会进入`then`，`then`只处理值通道，错误会原样向后传递，直到遇到`upon_error`（或其他处理错误的算法）。如果最后一直没人处理，`sync_wait`会把这个错误作为异常抛出。
+
+## just_stopped - 引入一个“已取消”的结果
 
 **原文定义：**
 
 > *stdexec::just_stopped produces a sender that immediately completes via set_stopped (no datums — the stopped channel carries none).*
 
-这个的定义的作用是执行字面量消除操作，将一个值转换为一个立即停止的 sender。
+`stdexec::just_stopped`不接受任何参数，它返回一个 sender，启动后立即通过停止通道（`set_stopped`）完成，停止通道不携带任何数据。
+
+它常用来人为制造“被取消”这条路径，方便测试后面的`upon_stopped`等算法。和`just_error`一样，`then`不会处理它，停止信号会原样向后传递。
 
 **使用案例：**
 
@@ -54,7 +58,9 @@ void run(const char* name, Sender source)
 
     auto work =
         std::move(source)
-        | stdexec::then([](int value) {
+        // 注意 noexcept：不加的话 then 会额外多出 set_error(std::exception_ptr)，
+        // 而下面 upon_error 的 lambda 只能接收 std::string，会导致编译失败
+        | stdexec::then([](int value) noexcept {
               std::cout << "then：处理成功值 " << value << '\n';
               return value * 2;
           })
@@ -92,7 +98,7 @@ int main()
 
 > *`stdexec::read_env` lets a pipeline inspect properties of its receiver — the receiver’s stop token, allocator, preferred scheduler, and anything else the environment exposes. You give it a query CPO (`stdexec::get_stop_token`, `stdexec::get_scheduler`, …) and get back a sender that, when started, evaluates that query against the connected receiver’s environment and delivers the result as a value.*
 
-查询一个source的状态，根据其反映的状态来决定下一步的操作。
+读取“接收者环境”里的信息（如停止令牌、调度器、分配器等），并把读到的值作为值完成发给后面的算法。注意，它读的是**下游**（最终连接的 receiver）提供的环境，而不是上游 sender 的状态。
 
 **原理剖析：**
 
@@ -100,7 +106,7 @@ int main()
 
 在`stdexec`中，有一个停止请求源的类型：`stdexec::inplace_stop_source`，这个类型提供两个核心操作：`get_token()`和`request_stop()`。
 
-此时的`stdexec::read_env`的作用是通过`stdexec::get_stop_token`读取`token`的状态，从而停止整个循环的工作，案例如下：
+此时的`stdexec::read_env`的作用是通过`stdexec::get_stop_token`从环境中取出`token`，后续的算法再根据`token`的状态来停止循环，案例如下：
 
 ```cpp
 auto token = source.get_token();
@@ -130,6 +136,13 @@ auto b = stdexec::read_env(stdexec::get_stop_token)
                // 执行一轮工作
            }
          });
+
+// 方式二需要调用方真的把 token 放进环境，否则读到的是 never_stop_token，
+// stop_requested() 永远为 false，循环永远不会退出。
+// 直接用 sync_wait(b) 就属于这种情况：sync_wait 的环境不提供 stop token。
+// 可以用 write_env 手动把 token 写进环境：
+auto c = std::move(b)
+       | stdexec::write_env(stdexec::prop{stdexec::get_stop_token, token});
 ```
 
 ## schedule — 在调度器上启动一个管道操作
@@ -152,3 +165,26 @@ auto sndr =
 auto [v] = stdexec::sync_wait(std::move(sndr)).value();
 // v == 42, computed on the parallel scheduler
 ```
+
+## | 左结合符号解析
+
+**接下来用一个案例说明：**
+
+```cpp
+auto s1 = stdexec::then(sndr, f);
+```
+和
+
+```cpp
+auto s2 = sndr | stdexec::then(f);
+```
+相互等效，那我们可以推导，左结合是以有到右的方式传参数：
+
+```cpp
+sndr | stdexec::then(f) = stdexec::then(sndr, f)
+// 同样，有
+
+sndr | stdexec::then(f) | stdexec::then_error(g) | stdexec::then_stopped(s) = stdexec::then_stopped(stdexec::then_error(stdexec::then(sndr, f), g))
+```
+
+将这个传入`stdexec::sync_wait`，sync_wait会等待发送器完成并返回结果。
