@@ -54,6 +54,103 @@
 auto sender = stdexec::schedule(sched);
 ```
 
+### connect 与 start：从描述到执行
+
+严格来说，通常写的是 `stdexec::connect(sender, receiver)` 和 `stdexec::start(op)`：它们是**定制点对象（CPO）**，提供统一的调用入口，再分派到具体类型的实现。`connect` 面向 sender，`start` 面向它返回的 operation state，而不是直接对 sender 调用 `start`。
+
+先区分三个角色：
+
+| 角色 | 作用 |
+|---|---|
+| sender（发送者） | 描述要做什么，例如产生 `42`、执行函数或调度到线程池 |
+| receiver（接收者） | 定义完成后如何接收值、错误或停止信号 |
+| operation state（操作状态） | 保存这一次执行需要的状态，把计算描述与结果接收方绑定起来 |
+
+#### 1. connect：构造一次执行所需的状态
+
+```cpp
+auto op = stdexec::connect(std::move(sender), std::move(receiver));
+```
+
+`connect` 根据 sender 和 receiver 的具体类型，构造对应的操作状态。它通常保存 receiver、sender 携带的数据，以及执行中需要的资源或子操作状态。比如 `just(42)` 的操作状态需要保存待发送的 `42` 和接收它的 receiver。
+
+**这一步建立连接，不启动所描述的计算。** 不过，构造状态本身仍然会执行代码，例如移动对象、准备资源，也可能抛出异常。因此，“惰性”并不表示 `connect` 完全没有开销。
+
+对于组合 sender，连接过程通常还会为上游构造内部 receiver。例如 `just(21) | then(f)` 中，内部 receiver 收到 `21` 后执行 `f`，再把结果交给下游 receiver；具体实现可以合并或优化这些状态。
+
+#### 2. start：启动操作状态
+
+```cpp
+stdexec::start(op);
+```
+
+`start` 分派到操作状态的启动实现。它返回 `void`，且不能向外抛异常；**计算结果通过 receiver 交付，不通过 `start` 的返回值交付**。
+
+启动不等于创建线程，也不等于等待完成：
+
+- `just(42)` 可以在调用 `start` 的线程上立即交付 `42`，在 `start` 返回前就完成。
+- 线程池调度器产生的 `schedule(sched)` 通常在启动时把任务入队，之后由工作线程发送完成信号。
+
+因此，执行发生在哪条线程上、何时完成，由具体 sender 和执行上下文决定，不能仅凭 `start` 判断。
+
+#### 3. 完成：通过 receiver 回传结果
+
+一次操作最终通过以下三种完成通道之一通知 receiver：
+
+| 完成调用 | 含义 |
+|---|---|
+| `stdexec::set_value(std::move(receiver), values...)` | 成功完成，传递零个或多个值 |
+| `stdexec::set_error(std::move(receiver), error)` | 以错误完成，传递错误对象 |
+| `stdexec::set_stopped(std::move(receiver))` | 以停止状态完成，不携带值 |
+
+同一次操作只发送一次完成信号。具体 sender 支持哪些通道，由它的完成签名决定，例如 `just(42)` 只需要值通道。
+
+下面用同步完成的 `just` 展示整个流程：
+
+```cpp
+#include <stdexec/execution.hpp>
+#include <cstdio>
+#include <utility>
+
+struct print_receiver {
+    using receiver_concept = stdexec::receiver_tag;
+
+    auto get_env() const noexcept -> stdexec::env<> { return {}; }
+
+    void set_value(int value) && noexcept {
+        std::printf("收到：%d\n", value);
+    }
+};
+
+int main() {
+    auto sender = stdexec::just(42);  // 描述计算，尚未交付值
+    auto op = stdexec::connect(std::move(sender), print_receiver{});
+    // op 保存本次执行的状态，此时仍未打印
+    stdexec::start(op);              // 同步调用 receiver，打印“收到：42”
+}
+```
+
+流程可以记为：
+
+```text
+sender + receiver
+        │ connect：绑定并构造状态
+        ▼
+  operation state
+        │ start：启动
+        ▼
+  执行计算 / 提交任务
+        │ 完成（可能立即，也可能稍后）
+        ▼
+receiver 的 set_value / set_error / set_stopped
+```
+
+**生命周期约束：** 对同一个操作状态只能调用一次 `start`，并以左值 `op` 传入；操作状态必须保持稳定，不能在执行中移动或提前销毁，至少要存活到完成通知。`start` 返回并不代表异步操作已经完成。上例能在 `main` 结束时安全销毁 `op`，是因为 `just` 已经同步完成；换成线程池操作时，就需要等待机制来保证生命周期。sender 若引用了外部对象，这些对象的生命周期也需要单独保证。
+
+日常使用 `stdexec::sync_wait(sender)` 时，连接内部 receiver、保存操作状态、调用 `start` 并等待完成等步骤由消费者负责，因此通常不需要手写这些底层调用。
+
+参考：[官方开发者指南](https://nvidia.github.io/stdexec/developer/index.html)与 [connect / start 参考文档](https://nvidia.github.io/stdexec/reference/index.html)。
+
 ## sender algorithm 发送方方法
 
 **原文定义：**
