@@ -25,7 +25,7 @@
 构造期是适配器的执行逻辑的第一阶段，它在发送器被构造时执行。这个时期是使用发送器和发送器适配器构造发送器的过程。
 
 ```cpp
-auto s = stdexec::then(32) | stdexec::then([](int i) { return i * 2; });
+auto s = stdexec::just(21) | stdexec::then([](int i) { return i * 2; });
 // ↑ 构造期：只是把 just、then 和 f 存进嵌套对象，f 没有被调用
 ```
 
@@ -46,7 +46,7 @@ auto op = stdexec::connect(s, some_receiver);
 
 ```cpp
 stdexec::start(op);
-// ↑ start：just 发出 set_value(21)，then 的 receiver 收到后才调用 f，这时才会打印
+// ↑ start：just 发出 set_value(21)，then 的内部 receiver 收到后调用回调，向下游发送 42
 ```
 
 ## let系列适配器
@@ -55,13 +55,13 @@ stdexec::start(op);
 - let_error
 - let_stopped
 
-这个let系列适配器和then系列适配器的区别在于then返回的值是sender，其他语法几乎一样。
+then 和 let_value 与上游组合后，都返回 sender。区别在于如何处理回调的返回值：then 把返回值作为普通值传给下游；let_value 要求回调返回 sender，连接并启动它，再把它的完成结果传给下游。let_error 和 let_stopped 分别对错误、停止通道执行类似的接续。
 
-**疑问：** 明明let是返回一个sender，但为什么取的最终返回值的操作和let的取值操作一样
+为什么 then 和 let_value 最后都能通过 sync_wait 获得普通值？因为 sync_wait 接收的是整条链的完成结果。接续内部 sender 是 let_value 的职责，不是 sync_wait 递归执行返回的 sender。
 
 let_value 会启动回调返回的 sender，并把它产生的值、错误或停止信号传给后续步骤。
 
-例如：
+例如（以下是执行链片段，构造后还需连接并启动，例如交给 sync_wait）：
 ```cpp
 ex::just(1)
 | ex::let_value([](int& x) {
@@ -72,7 +72,10 @@ ex::just(1)
 });
 ```
 这条链被启动后：
-上游 just(1) 产生 1。
-let_value 调用回调，得到 just(2) 这个 sender。
-let_value 连接并启动 just(2)。
-just(2) 产生 2，传给后面的 then。
+
+1. 上游 just(1) 产生 1。
+2. let_value 调用回调，得到 just(2) 这个 sender。
+3. let_value 连接并启动 just(2)。
+4. just(2) 产生 2，传给后面的 then。
+
+消费者会提供最终 receiver，再通过 connect 得到 operation state 并调用 start。receiver 接收完成信号，不提供 future.get() 这样的统一取值接口；对于 sync_wait，最终 receiver 保存结果并结束等待，最后由 sync_wait 返回结果。具体对象结构见 [内部执行流程](senderExecutionFlow.md)，执行资源切换见 [调度适配器](SchedulingAdaptors.md)。
